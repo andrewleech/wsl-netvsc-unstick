@@ -75,7 +75,7 @@ leave the `.ko` on disk.
 ## Build
 
 ```sh
-git clone https://github.com/<you>/netvsc-unstick && cd netvsc-unstick
+git clone https://github.com/andrewleech/wsl-netvsc-unstick && cd wsl-netvsc-unstick
 
 # one-time per kernel version: downloads ~250MB, configures from the running
 # kernel's /proc/config.gz, runs modules_prepare
