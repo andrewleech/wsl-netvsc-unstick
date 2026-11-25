@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""netvsc-unstick: diagnose and recover the WSL2 hv_netvsc rtnl_lock deadlock.
+
+  sudo ./netvsc-unstick status            # diagnose, change nothing
+  sudo ./netvsc-unstick recover           # diagnose, then recover (asks first)
+  sudo ./netvsc-unstick recover eth7 -y   # one interface, no prompt
+
+Background: https://github.com/microsoft/WSL/issues/41622. When hv_netvsc fails
+to open a sub-channel ("sub channel open failed: -12"), WSL's GnsEngine ends up
+spinning forever inside netvsc_wait_until_empty() holding rtnl_lock, and every
+networking call in the distro hangs. This tool finds that holder, checks which
+channels are dead, and (for `recover`) asks the netvsc_unstick kernel module to
+release it. See docs/how-it-works.md.
+
+It deliberately never touches the network stack (no `ip`, no netlink, no
+sockets): those hang, uninterruptibly, while the lock is wedged. It reads the
+lock owner from /proc/kcore and interface names from sysfs.
+
+Exit codes
+  status : 0 no wedge, 10 wedged by THIS deadlock, 11 wedged by something else
+  recover: 0 done / nothing to do, 2 refused (not this bug, or unsafe),
+           3 attempted but lock not released, 4 usage / environment problem
+"""
+import argparse
+import bisect
+import os
+import re
+import struct
+import subprocess
+import sys
+import time
+
+VERSION = "0.1"
+DEBUGFS = "/sys/kernel/debug/netvsc_unstick/fix"
+HERE = os.path.dirname(os.path.realpath(__file__))
+KO = os.path.join(HERE, "netvsc_unstick.ko")
+DRIVER = "hv_netvsc"
+STUCK_FUNC = "netvsc_wait_until_empty"
+RELEASE_WAIT = 15          # seconds to wait for rtnl_lock to be released after recovery
+
+
+# --------------------------------------------------------------------------
+# kernel memory access (read-only)
+# --------------------------------------------------------------------------
+class Kernel:
+    """Just enough kcore/kallsyms/BTF access to read the rtnl_mutex owner."""
+
+    def __init__(self):
+        self.syms = []
+        self.rtnl = None
+        for line in open("/proc/kallsyms"):
+            p = line.split()
+            a = int(p[0], 16)
+            if a == 0:
+                raise RuntimeError("kallsyms addresses are zero (not root, or kptr_restrict=2)")
+            if p[2] == "rtnl_mutex":
+                self.rtnl = a
+            if p[1] in "tTwW":
+                self.syms.append((a, p[2]))
+        if self.rtnl is None:
+            raise RuntimeError("rtnl_mutex not found in /proc/kallsyms")
+        self.syms.sort()
+        self.addrs = [s[0] for s in self.syms]
+
+        self.ts = self._offsets("task_struct", ["__state", "pid", "comm", "thread"])
+        self.sp_off = self.ts["thread"] + self._offsets("thread_struct", ["sp"])["sp"]
+
+        self.f = open("/proc/kcore", "rb")
+        hdr = self.f.read(64)
+        phoff = struct.unpack_from("<Q", hdr, 32)[0]
+        phentsize, phnum = struct.unpack_from("<HH", hdr, 54)
+        self.segs = []
+        for i in range(phnum):
+            self.f.seek(phoff + i * phentsize)
+            t, _, off, va, _, fs, _, _ = struct.unpack("<IIQQQQQQ", self.f.read(phentsize)[:56])
+            if t == 1:
+                self.segs.append((va, fs, off))
+
+    @staticmethod
+    def _offsets(struct_name, fields):
+        try:
+            out = subprocess.run(["pahole", "-C", struct_name, "/sys/kernel/btf/vmlinux"],
+                                 capture_output=True, text=True, check=True).stdout
+        except (OSError, subprocess.CalledProcessError) as e:
+            raise RuntimeError("pahole + /sys/kernel/btf/vmlinux required (%s)" % e)
+        res = {}
+        for f in fields:
+            m = re.search(r"\b%s(?:\[\d+\])?;\s*/\*\s*(\d+)" % re.escape(f), out)
+            if not m:
+                raise RuntimeError("cannot find %s.%s via pahole" % (struct_name, f))
+            res[f] = int(m.group(1))
+        return res
+
+    def read(self, addr, n):
+        for va, fs, off in self.segs:
+            if va <= addr < va + fs:
+                self.f.seek(off + addr - va)
+                return self.f.read(n)
+        raise RuntimeError("unmapped kernel address %#x" % addr)
+
+    def u64(self, a):
+        return struct.unpack("<Q", self.read(a, 8))[0]
+
+    def u32(self, a):
+        return struct.unpack("<I", self.read(a, 4))[0]
+
+    def sym(self, a):
+        i = bisect.bisect_right(self.addrs, a) - 1
+        if i < 0 or a - self.syms[i][0] >= 0x2000:
+            return None
+        return self.syms[i][1]
+
+    def holder(self):
+        """Return dict describing the rtnl_mutex owner, or None if unlocked."""
+        owner = self.u64(self.rtnl)
+        task = owner & ~7
+        if not task:
+            return None
+        h = {
+            "task": task,
+            "waiters": bool(owner & 1),
+            "pid": self.u32(task + self.ts["pid"]),
+            "state": self.u32(task + self.ts["__state"]),
+            "comm": self.read(task + self.ts["comm"], 16).split(b"\0")[0].decode(errors="replace"),
+            "frames": [],
+        }
+        sp = self.u64(task + self.sp_off)
+        for i in range(0, 600):
+            w = self.u64(sp + i * 8)
+            if 0xFFFFFFFF81000000 <= w < 0xFFFFFFFF84000000:
+                s = self.sym(w)
+                if s and s != "srso_return_thunk":
+                    h["frames"].append(s)
+        return h
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+def say(msg=""):
+    print(msg, flush=True)
+
+
+def netvsc_interfaces():
+    """hv_netvsc interface names, from sysfs only (no netlink)."""
+    names = []
+    base = "/sys/class/net"
+    for n in sorted(os.listdir(base)):
+        try:
+            drv = os.path.basename(os.readlink(os.path.join(base, n, "device", "driver")))
+        except OSError:
+            continue
+        if drv == DRIVER:
+            names.append(n)
+    return names
+
+
+def kmsg_lines():
+    out = subprocess.run(["dmesg"], capture_output=True, text=True).stdout
+    return out.splitlines()
+
+
+def ts_of(line):
+    m = re.match(r"\[\s*([0-9.]+)\]", line)
+    return float(m.group(1)) if m else None
+
+
+def module_loaded():
+    return os.path.isdir("/sys/module/netvsc_unstick")
+
+
+def ensure_module():
+    """Load the module if needed. Returns (ok, message)."""
+    if module_loaded() and os.path.exists(DEBUGFS):
+        return True, "module already loaded"
+    if not os.path.exists(KO):
+        return False, "netvsc_unstick.ko not found next to this script; run `make` (see README)"
+    vm = subprocess.run(["modinfo", "-F", "vermagic", KO], capture_output=True, text=True).stdout.split()
+    run = os.uname().release
+    if not vm or vm[0] != run:
+        return False, ("module was built for %s but the running kernel is %s; "
+                       "rebuild (scripts/setup-kernel-tree.sh && make)" % (vm[0] if vm else "?", run))
+    r = subprocess.run(["insmod", KO], capture_output=True, text=True)
+    if r.returncode != 0:
+        return False, "insmod failed: %s (see `dmesg | tail`)" % r.stderr.strip()
+    if not os.path.exists(DEBUGFS):
+        return False, "module loaded but %s missing (is debugfs mounted?)" % DEBUGFS
+    return True, "module loaded"
+
+
+def module_cmd(cmd):
+    """Write a command to the module and return the netvsc_unstick log lines it produced."""
+    before = kmsg_lines()
+    t0 = ts_of(before[-1]) if before else 0.0
+    with open(DEBUGFS, "w") as f:
+        f.write(cmd + "\n")
+    time.sleep(0.3)
+    return [l for l in kmsg_lines() if "netvsc_unstick:" in l and (ts_of(l) or 0) > (t0 or 0)]
+
+
+def dry_run(ifname):
+    """Return (dead_channel_indexes, healthy_count) for ifname."""
+    lines = module_cmd("%s dry" % ifname)
+    dead, healthy = [], 0
+    for l in lines:
+        m = re.search(r"DRY \S+ chan\[(\d+)\] napi\.state=(0x[0-9a-f]+) .* in\.rb=(\S+) out\.rb=(\S+)", l)
+        if not m:
+            continue
+        idx, state = int(m.group(1)), int(m.group(2), 16)
+        sched_npsvc = (state & 0x1) and (state & 0x8)
+        rings_null = int(m.group(3), 16) == 0 and int(m.group(4), 16) == 0
+        if sched_npsvc:
+            dead.append((idx, state, rings_null))
+        else:
+            healthy += 1
+    return dead, healthy
+
+
+def failure_summary():
+    fail = 0
+    last = None
+    for l in kmsg_lines():
+        if "sub channel open failed" in l:
+            fail += 1
+            last = l
+    return fail, last
+
+
+# --------------------------------------------------------------------------
+# diagnosis
+# --------------------------------------------------------------------------
+def diagnose(kern, samples=3, interval=1.0):
+    """Sample the lock owner. Returns (verdict, holder) where verdict is one of
+    'unlocked', 'transient', 'match', 'other'."""
+    seen = []
+    for i in range(samples):
+        seen.append(kern.holder())
+        if i + 1 < samples:
+            time.sleep(interval)
+    if all(h is None for h in seen):
+        return "unlocked", None
+    held = [h for h in seen if h]
+    if len(held) < len(seen):
+        return "transient", held[-1]          # was released during sampling
+    pids = {h["pid"] for h in held}
+    if len(pids) > 1:
+        return "transient", held[-1]          # different owners: normal contention
+    h = held[-1]
+    in_func = STUCK_FUNC in h["frames"][:25]
+    if in_func and h["state"] == 0x2:
+        return "match", h
+    return "other", h
+
+
+def print_holder(h):
+    say("  owner : pid %d (%s), state %#x%s, waiters: %s" % (
+        h["pid"], h["comm"], h["state"], " (uninterruptible)" if h["state"] == 2 else "",
+        "yes" if h["waiters"] else "no"))
+    say("  stack : " + " <- ".join(h["frames"][:8]))
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+def cmd_status(args, quiet_header=False):
+    if not quiet_header:
+        say("netvsc-unstick %s   kernel %s" % (VERSION, os.uname().release))
+    say("\n[1] rtnl_lock")
+    kern = Kernel()
+    verdict, h = diagnose(kern)
+    if verdict == "unlocked":
+        say("  not held: no rtnl wedge right now.")
+    elif verdict == "transient":
+        say("  held, but the owner changed or released during sampling: normal contention, not a wedge.")
+    elif verdict == "match":
+        say("  HELD BY THE KNOWN DEADLOCK: owner is stuck in %s." % STUCK_FUNC)
+        print_holder(h)
+    else:
+        say("  held persistently by something that is NOT this bug (no %s in its stack)." % STUCK_FUNC)
+        print_holder(h)
+        say("  This tool will not help with that.")
+
+    say("\n[2] kernel log")
+    fails, last = failure_summary()
+    if fails:
+        say("  %d 'sub channel open failed' line(s) in dmesg, latest:" % fails)
+        say("    " + last.strip()[:150])
+    else:
+        say("  no 'sub channel open failed' in dmesg.")
+
+    say("\n[3] channels")
+    ifaces = args.iface and [args.iface] or netvsc_interfaces()
+    if not ifaces:
+        say("  no hv_netvsc interfaces found in sysfs.")
+        return verdict, h, {}
+    ok, msg = ensure_module() if (args.load or module_loaded()) else (False, "module not loaded")
+    if not ok:
+        say("  cannot inspect channels: %s" % msg)
+        say("  (run with --load to load netvsc_unstick.ko, or `sudo insmod netvsc_unstick.ko`)")
+        return verdict, h, {}
+    dead_by_if = {}
+    for n in ifaces:
+        dead, healthy = dry_run(n)
+        dead_by_if[n] = dead
+        if dead:
+            idx = ",".join(str(d[0]) for d in dead)
+            nullrings = all(d[2] for d in dead)
+            say("  %s: %d dead channel(s) [%s]%s, %d healthy" % (
+                n, len(dead), idx, "" if nullrings else "  (WARNING: some have non-NULL rings)", healthy))
+        else:
+            say("  %s: no dead channels (%d healthy)" % (n, healthy))
+
+    total = sum(len(v) for v in dead_by_if.values())
+    say("")
+    if verdict == "match" and total:
+        say("Diagnosis: this is the deadlock. Run `recover` to release it.")
+    elif verdict in ("unlocked", "transient") and total:
+        say("Diagnosis: not wedged now, but %d dead channel(s) exist. The next MTU change or" % total)
+        say("interface-down by WSL will wedge it. (You can run `recover --force` to defuse them;")
+        say("see README, this path is less tested.)")
+    elif verdict == "match" and not total:
+        say("Diagnosis: wedge signature in the lock owner but no dead channels found; not safe to act.")
+    elif verdict == "other":
+        say("Diagnosis: a wedge, but not this one.")
+    else:
+        say("Diagnosis: healthy.")
+    return verdict, h, dead_by_if
+
+
+def cmd_recover(args):
+    if args.iface and not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", args.iface):
+        say("error: bad interface name"); return 4
+    verdict, h, dead_by_if = cmd_status(args)
+    total = sum(len(v) for v in dead_by_if.values())
+
+    if verdict == "other":
+        say("\nRefusing: the lock holder is not the known deadlock."); return 2
+    if verdict != "match" and not args.force:
+        say("\nNothing to recover (not currently wedged). Use --force to defuse dead channels anyway.")
+        return 0
+    if not total:
+        say("\nNo dead channels to act on."); return 2 if verdict == "match" else 0
+    if verdict == "match" and not all(d[2] for v in dead_by_if.values() for d in v) and not args.force:
+        say("\nRefusing: a dead-looking channel has non-NULL ring buffers, which this tool does not expect.")
+        return 2
+
+    targets = [n for n, v in dead_by_if.items() if v]
+    say("\nAbout to recover: %s" % ", ".join("%s (%d channels)" % (n, len(dead_by_if[n])) for n in targets))
+    say("This writes to kernel memory, taints the kernel, and expects ~1 WARNING per channel in dmesg.")
+    say("Worst case is a VM crash/restart (same as wsl --shutdown). Save your work first.")
+    if not args.yes:
+        if not sys.stdin.isatty():
+            say("error: not a terminal; pass -y/--yes to proceed"); return 4
+        if input("Proceed? [y/N] ").strip().lower() not in ("y", "yes"):
+            say("aborted."); return 0
+
+    for n in targets:
+        say("\nrecovering %s ..." % n)
+        for l in module_cmd(n):
+            if "recovering" in l or "done" in l:
+                say("  " + re.sub(r"^\[[^\]]*\] netvsc_unstick: ", "", l))
+
+    say("\nVerifying ...")
+    kern = Kernel()
+    deadline = time.time() + RELEASE_WAIT
+    released = False
+    while time.time() < deadline:
+        if kern.holder() is None:
+            released = True
+            break
+        time.sleep(0.5)
+    if released:
+        say("  rtnl_lock released.")
+    else:
+        h2 = kern.holder()
+        say("  rtnl_lock STILL HELD after %ds by pid %d (%s)." % (RELEASE_WAIT, h2["pid"], h2["comm"])
+            if h2 else "  lock state changed during the final check.")
+        say("  Recovery did not complete. Check `dmesg | tail -50`; `wsl --shutdown` is the fallback.")
+        return 3
+
+    remaining = {n: dry_run(n)[0] for n in targets}
+    left = sum(len(v) for v in remaining.values())
+    if left:
+        say("  NOTE: %d dead channel(s) remain after the device re-attached (%s)." % (
+            left, ", ".join("%s:%d" % (n, len(v)) for n, v in remaining.items() if v)))
+        say("  The allocation failed again during re-attach. It can wedge at the next MTU change;")
+        say("  re-run `recover` then. (See README 'Limitations'.)")
+    else:
+        say("  no dead channels remain.")
+    say("\nDone. `ip route` / `ping` should work now.")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="netvsc-unstick",
+        description="Diagnose and recover the WSL2 hv_netvsc rtnl_lock deadlock (microsoft/WSL#41622). "
+                    "Never uses the network stack, so it works while wedged.",
+        epilog="Run as root. Start with `status`.")
+    ap.add_argument("--version", action="version", version="netvsc-unstick " + VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("status", help="diagnose; changes nothing (loads no module unless --load)")
+    p.add_argument("iface", nargs="?", help="limit to one interface (default: all hv_netvsc)")
+    p.add_argument("--load", action="store_true", help="load netvsc_unstick.ko if it is not loaded (to inspect channels)")
+
+    p = sub.add_parser("recover", help="diagnose, then release the deadlock (asks first)")
+    p.add_argument("iface", nargs="?", help="limit to one interface (default: all hv_netvsc)")
+    p.add_argument("-y", "--yes", action="store_true", help="do not prompt")
+    p.add_argument("--force", action="store_true",
+                   help="act on dead channels even when not currently wedged (less tested)")
+    args = ap.parse_args()
+    if args.cmd == "recover":
+        args.load = True
+
+    if os.geteuid() != 0:
+        print("error: run as root (sudo)", file=sys.stderr); return 4
+    if not os.uname().release.endswith("WSL2"):
+        print("warning: not a WSL2 kernel (%s); this tool is only meant for WSL2" % os.uname().release, file=sys.stderr)
+    try:
+        if args.cmd == "status":
+            v, _, _ = cmd_status(args)
+            return {"match": 10, "other": 11}.get(v, 0)
+        return cmd_recover(args)
+    except RuntimeError as e:
+        print("error: %s" % e, file=sys.stderr)
+        return 4
+
+
+if __name__ == "__main__":
+    sys.exit(main())

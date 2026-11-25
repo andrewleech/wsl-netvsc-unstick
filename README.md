@@ -15,6 +15,11 @@ unwedges it **without restarting WSL**.
 > first. If it goes wrong the failure mode is a VM crash/restart, which is
 > what you would have done to recover anyway.
 
+The `netvsc-unstick` CLI wraps the manual steps that worked in that run. Its
+detection and refusal logic is covered by unit tests with a faked lock owner,
+but it has not yet been run against a real wedge; the first real use of
+`recover` will be its first end-to-end test. Use `status` first.
+
 It is a **recovery tool, not a fix.** It does not stop the allocation failure
 that causes the problem. See [Limitations](#limitations).
 
@@ -37,24 +42,21 @@ You have it if, after the network goes away inside WSL while Windows is fine
 
 3. Confirm *who* holds the lock. The holder is `GnsEngine`, WSL's in-guest
    network daemon, which lives in the VM's root PID namespace and so **does not
-   appear in `ps` or `/proc/*/stack` inside your distro**.
-   `scripts/find_rtnl_holder.py` reads it straight out of kernel memory
-   without touching the (wedged) network stack:
+   appear in `ps` or `/proc/*/stack` inside your distro**. `netvsc-unstick
+   status` reads it straight out of kernel memory (`/proc/kcore`) without
+   touching the wedged network stack:
 
    ```
-   $ sudo python3 scripts/find_rtnl_holder.py
-   rtnl_mutex @ 0xffffffff843fdf60  owner raw = 0xffff8ea28632de01
-   waiters present: True
-   owner: pid=245 comm=GnsEngine __state=0x2 (0x2 = uninterruptible)
-      272  msleep+0x38
-      304  netvsc_wait_until_empty+0x49
-      360  netvsc_detach+0x135
-      440  netvsc_change_mtu+0xb9
+   $ sudo ./netvsc-unstick status
+   [1] rtnl_lock
+     HELD BY THE KNOWN DEADLOCK: owner is stuck in netvsc_wait_until_empty.
+     owner : pid 245 (GnsEngine), state 0x2 (uninterruptible), waiters: yes
+     stack : schedule <- msleep <- netvsc_wait_until_empty <- netvsc_detach <- netvsc_change_mtu
    ```
 
    `msleep <- netvsc_wait_until_empty <- netvsc_detach <- netvsc_change_mtu` is
-   this bug. If the owner is something else, or the mutex is unlocked, this
-   module will not help.
+   this bug. If the owner is something else, or the lock is free, this tool will
+   say so and will not act.
 
 ## Requirements
 
@@ -97,13 +99,41 @@ Troubleshooting the build is in [docs/maintenance.md](docs/maintenance.md#build-
 
 ## Use
 
+`netvsc-unstick` is the command-line front end. It never uses the network stack
+(no `ip`, no sockets), so it works while WSL is wedged. Run it as root from the
+repo directory, where `netvsc_unstick.ko` sits next to it.
+
 ```sh
-sudo insmod netvsc_unstick.ko        # loading does nothing by itself
+sudo ./netvsc-unstick status          # diagnose; changes nothing
+sudo ./netvsc-unstick recover         # diagnose, then recover (asks first)
+sudo ./netvsc-unstick recover eth7 -y # one interface, no prompt
 ```
 
-When the network is wedged:
+`recover` loads the module if needed (checking its `vermagic` against the
+running kernel), then:
+
+1. confirms the lock is held by the known deadlock (3 samples, 1s apart, so a
+   normal short hold is not mistaken for it),
+2. does a dry run to find dead channels (`napi.state` has `SCHED` and `NPSVC`
+   set, ring buffers NULL),
+3. **refuses** if the holder is anything else, if no dead channels are found, or
+   if a dead-looking channel has non-NULL rings,
+4. asks for confirmation (`-y` to skip; required when not on a terminal),
+5. recovers, waits up to 15s for the lock to be released, then re-checks and
+   tells you if the re-attach left new dead channels.
+
+`status` exits 0 when there is no wedge, 10 when wedged by this deadlock and 11
+when wedged by something else, so it can be scripted. `recover --force` acts on
+dead channels even when nothing is wedged right now (it defuses them before the
+next MTU change; this path has had less testing).
+
+### What it does under the hood
+
+The module is driven by one debugfs file; the tool is a wrapper around it. You can
+do the same by hand:
 
 ```sh
+sudo insmod netvsc_unstick.ko        # loading does nothing by itself
 # 1. Look first. Reports every sub-channel's state, modifies nothing.
 echo "eth7 dry" | sudo tee /sys/kernel/debug/netvsc_unstick/fix
 sudo dmesg | grep netvsc_unstick | tail -20
@@ -128,7 +158,7 @@ echo eth7 | sudo tee /sys/kernel/debug/netvsc_unstick/fix
 ```
 
 `ip route`, `ping` etc. should start returning within about a second, and
-`find_rtnl_holder.py` should report the mutex unlocked.
+`./netvsc-unstick status` should report the lock free.
 
 `echo 1 | sudo tee .../fix` applies to every `hv_netvsc` device instead of one.
 Prefer naming the interface.
@@ -166,17 +196,18 @@ sudo rmmod netvsc_unstick            # optional
 
 | Path | What |
 |---|---|
-| `netvsc_unstick.c` | the module |
+| `netvsc-unstick` | the CLI: `status` / `recover` (holder detection, dry run, recovery, verification) |
+| `netvsc_unstick.c` | the kernel module it drives |
+| `tests/` | unit tests for the CLI's decision logic (`python3 -m unittest discover -s tests`) |
 | `Makefile` | build against `./kernel-src` (or `KSRC=`), version-guarded |
 | `scripts/setup-kernel-tree.sh` | fetch and prepare the matching kernel source tree |
 | `scripts/check-abi.sh` | verify `struct module` size matches the running kernel |
-| `scripts/find_rtnl_holder.py` | identify the `rtnl_mutex` holder on a wedged system |
 | `docs/how-it-works.md` | root cause with source references, why each step is needed |
 | `docs/maintenance.md` | adapting to new kernel versions, build problems |
 
 ## Reporting results
 
-Useful for the upstream issue: kernel version, whether `find_rtnl_holder.py`
+Useful for the upstream issue: kernel version, whether `netvsc-unstick status`
 showed `GnsEngine` in `netvsc_wait_until_empty`, the dry-run output, whether
 recovery worked, and any oops/panic text from `dmesg`.
 

@@ -73,8 +73,8 @@ and stop shipping builds for that version.
 You cannot test on demand, the trigger needs weeks of fragmentation. In order of
 preference:
 
-1. Wait for a natural occurrence. Run `scripts/find_rtnl_holder.py`, then
-   `echo "<if> dry"`, and only recover if the dry run shows the `0x19` + NULL
+1. Wait for a natural occurrence. Run `sudo ./netvsc-unstick status`, which
+   shows the holder and the dead channels, and only recover if the dry run shows the `0x19` + NULL
    rings signature and the dead count matches the dmesg failures.
 2. Review the diff of the five functions in the table above between the old and
    new tag: `git diff linux-msft-wsl-<old>..linux-msft-wsl-<new> -- <file>`.
@@ -123,6 +123,6 @@ pahole -C task_struct /sys/kernel/btf/vmlinux | grep -E '__state|stack|pid|comm|
 pahole -C thread_struct /sys/kernel/btf/vmlinux | grep ' sp;'
 ```
 
-`scripts/find_rtnl_holder.py` does this automatically using pahole, so it adapts
+`netvsc-unstick` does this automatically using pahole, so it adapts
 to a new kernel without edits as long as BTF and `kallsyms` are available
 (`CONFIG_DEBUG_INFO_BTF=y`, `CONFIG_KALLSYMS=y`, `kptr_restrict` must allow root).

@@ -66,7 +66,7 @@ Line numbers drift between versions; search for the function names.
 
 `GnsEngine` runs in the utility VM's root PID namespace, so it is invisible from
 inside the distro: `ps` shows only the victims, which is why this looks like an
-"orphaned lock" with no owner. `scripts/find_rtnl_holder.py` finds it by reading
+"orphaned lock" with no owner. `netvsc-unstick status` finds it by reading
 `rtnl_mutex.owner` from `/proc/kcore`.
 
 ## What the module does, and why each part is there
