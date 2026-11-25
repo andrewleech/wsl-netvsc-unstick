@@ -16,3 +16,7 @@ modules.order
 .cache.mk
 *.symvers
 *.a
+
+# python
+__pycache__/
+*.pyc
