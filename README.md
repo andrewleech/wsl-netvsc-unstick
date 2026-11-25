@@ -7,18 +7,20 @@ Live recovery for the WSL2 networking hang described in
 distro hangs until you `wsl --shutdown`. This out-of-tree kernel module
 unwedges it **without restarting WSL**.
 
-> **Status: experimental.** Used successfully once, on
-> `6.18.58.1-microsoft-standard-WSL2` (x86_64, mirrored networking). An earlier
-> version of the idea panicked the VM. It taints your kernel, it pokes kernel
-> memory from outside the driver, and it has had very little testing. Read
+> **Status: experimental.** Used successfully twice on
+> `6.18.58.1-microsoft-standard-WSL2` (x86_64, mirrored networking): once by
+> hand (11 dead channels) and once end-to-end with `netvsc-unstick recover`
+> (4 dead channels, lock released, no crash). An earlier version of the idea
+> panicked the VM. It taints your kernel, it pokes kernel memory from outside
+> the driver, and it has had very little testing. Read
 > [How it works](docs/how-it-works.md) before using it, and save your work
 > first. If it goes wrong the failure mode is a VM crash/restart, which is
 > what you would have done to recover anyway.
 
-The `netvsc-unstick` CLI wraps the manual steps that worked in that run. Its
-detection and refusal logic is covered by unit tests with a faked lock owner,
-but it has not yet been run against a real wedge; the first real use of
-`recover` will be its first end-to-end test. Use `status` first.
+The `netvsc-unstick` CLI wraps the manual steps that worked. Its detection and
+refusal logic is covered by unit tests with a faked lock owner, and `recover`
+has been run once against a real wedge (see
+[docs/maintenance.md](docs/maintenance.md#tested-versions)). Use `status` first.
 
 It is a **recovery tool, not a fix.** It does not stop the allocation failure
 that causes the problem. See [Limitations](#limitations).
@@ -182,8 +184,8 @@ sudo rmmod netvsc_unstick            # optional
   detach and re-attach the NIC, and that re-attach can hit the same
   order-8 allocation failure and leave *new* dead channels, so it can wedge
   again at the next MTU change. Check with `echo "<if> dry"` after recovering
-  and run it again if needed. In the one real run, 11 channels were rescued and
-  4 new ones were dead straight after.
+  and run it again if needed. In the first manual run, 11 channels were rescued and
+  4 new ones were dead straight after; in the second (CLI) run none were.
 - Reducing the chance of the failure in the first place: add
   `kernelCommandLine=hv_netvsc.ring_size=64` under `[wsl2]` in `.wslconfig`
   (halves the contiguous allocation; the driver enforces 64 as the minimum, the

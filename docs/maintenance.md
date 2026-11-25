@@ -8,7 +8,8 @@ and how to diagnose build problems.
 
 | Kernel (`uname -r`) | Arch | Result |
 |---|---|---|
-| `6.18.58.1-microsoft-standard-WSL2` | x86_64 | Built, loaded, recovered a live wedge (11 dead channels). |
+| `6.18.58.1-microsoft-standard-WSL2` | x86_64 | Built, loaded, recovered a live wedge by hand (11 dead channels). |
+| `6.18.58.1-microsoft-standard-WSL2` | x86_64 | Second wedge (~12 days uptime), recovered end-to-end with `netvsc-unstick recover eth7 -y`: holder `GnsEngine` in `netvsc_wait_until_empty <- netvsc_close`, 4 dead channels recovered, lock released, no dead channels afterwards, no crash. |
 | `6.18.54.1-microsoft-standard-WSL2` | x86_64 | An earlier bit-clear-only version panicked the VM; the ring-buffer fix was developed against this tree and is the same logic. Not re-run on 54.1. |
 
 Add rows as people try it. arm64 is untested (the fields used are
